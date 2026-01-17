@@ -1,0 +1,209 @@
+
+
+
+```{r}
+library(tidyverse)
+library(cmdstanr)
+library(bayesplot)
+```
+
+
+```{r}
+df <- read_csv('homework/BMJSubmissions.csv')
+```
+
+
+weekend ~ country
+
+
+
+```{r}
+country_map <- df |>
+
+  distinct(country_name) |>
+  mutate(country_idx = row_number())
+
+country_map
+
+
+# Compile the model
+mod <- cmdstan_model("homework/homework_B01/p1_no_pool.stan")
+
+stan_data <- list(
+  N = nrow(df),
+  W = df$W, # make sure this is 0s and 1s
+  n_countries = nrow(country_map),
+  country_idx = df |>
+    left_join(country_map, by = join_by(country_name)) |>
+    pull(country_idx)
+)
+
+fit <- mod$sample(
+  data = stan_data,
+  seed = 123,
+  chains = 4,
+  parallel_chains = 4,
+  refresh = 500
+)
+```
+
+
+Diagnostics
+
+```{r}
+fit$summary()
+fit$cmdstan_diagnose() # main function
+
+fit$diagnostic_summary()
+fit$summary() |>
+  filter(rhat > 1.01 | ess_bulk < 400 | ess_tail < 400) #
+
+draws <- fit$draws(format = "df")
+
+mcmc_trace(draws)
+mcmc_trace(draws, pars = c("alpha[1]", "alpha[2]"))
+mcmc_rank_hist(draws, pars = c("alpha[1]", "alpha[2]"))
+
+
+```
+
+Analysis
+
+```{r}
+
+
+draws |>
+  select(starts_with(c("alpha", "mu_country"))) |>
+  pivot_longer(
+    everything()
+  ) |>
+  mutate(country_idx = str_extract(name, "\\d+") |> as.integer()) |>
+  left_join(country_map, by = join_by(country_idx)) |>
+  filter(str_detect(name, 'mu')) |>
+  ggplot(aes(value, country_name)) +
+  tidybayes::stat_pointinterval()
+
+```
+
+
+DRY analysis
+
+```{r}
+prepare_stan_data <- function(df) {
+  country_map <- df |>
+    distinct(country_name) |>
+    mutate(country_idx = row_number())
+
+  stan_data <- list(
+    N = nrow(df),
+    W = df$W,
+    n_countries = nrow(country_map),
+    country_idx = df |>
+      left_join(country_map, by = join_by(country_name)) |>
+      pull(country_idx)
+  )
+
+  list(data = stan_data, country_map = country_map)
+}
+
+fit_model <- function(stan_file, stan_data, ...) {
+  mod <- cmdstan_model(stan_file, dir = tempdir())
+  mod$sample(
+    data = stan_data,
+    seed = 123,
+    chains = 4,
+    parallel_chains = 4,
+    refresh = 500,
+    ...
+  )
+}
+
+
+check_diagnostics <- function(fit) {
+  diag <- fit$diagnostic_summary()
+
+  cli::cli_alert_info("Divergences: {sum(diag$num_divergent)}")
+
+  problems <- fit$summary() |>
+    filter(rhat > 1.01 | ess_bulk < 400 | ess_tail < 400)
+
+  if (nrow(problems) > 0) {
+    cli::cli_alert_warning("Problem parameters:\n")
+    print(problems)
+  } else {
+    cli::cli_alert_success("All Rhat < 1.01 and ESS > 400\n")
+  }
+
+  invisible(diag)
+}
+
+extract_country_param_data <- function(fit, country_map, model_name) {
+  fit |>
+    as_draws_df() |>
+    select(starts_with(c("alpha", "mu_country"))) |>
+    pivot_longer(
+      everything()
+    ) |>
+    mutate(country_idx = str_extract(name, "\\d+") |> as.integer()) |>
+    left_join(country_map, by = join_by(country_idx)) |>
+    mutate(model = model_name)
+}
+
+```
+
+
+
+```{r}
+stan_data <- prepare_stan_data(df)
+
+no_pool_fit <- fit_model(
+  'homework/homework_B01/p1_no_pool.stan',
+  stan_data = stan_data$data
+)
+
+partial_pool_fit <- fit_model(
+  'homework/homework_B01/p1_partial_pool.stan',
+  stan_data = stan_data$data
+)
+
+partial_pool_fit |> check_diagnostics()
+no_pool_fit |> check_diagnostics()
+
+no_pool_long <- no_pool_fit |>
+  extract_country_param_data(country_map, 'no_pool')
+
+partial_pool_long <- partial_pool_fit |>
+  extract_country_param_data(country_map, 'partial_pool')
+
+
+partial_pool_long |>
+  bind_rows(no_pool_long) |>
+  mutate(
+    variable = ifelse(str_detect(name, 'alpha'), 'alpha', 'p'),
+    country_name = fct_reorder(country_name, value, .fun = median, .desc = TRUE)
+  ) |>
+  filter(variable == 'p') |>
+  pull(country_name) |>
+  levels() -> country_order
+
+partial_pool_long |>
+  bind_rows(no_pool_long) |>
+  mutate(
+    variable = ifelse(str_detect(name, 'alpha'), 'alpha', 'p'),
+    country_name = factor(country_name, levels = country_order)
+  ) |>
+  ggplot(aes(value, country_name, color = model)) +
+  tidybayes::stat_halfeye(alpha = 0.5) +
+  facet_wrap(~variable, ncol = 2, scales = 'free_x')
+
+```
+
+
+```{r}
+df |>
+  summarise(x = mean(W), n = n(), .by = country_name) |>
+  arrange(-x)
+```
+
+
+The countries probability to submit on the weekend parameter shrinks. A country like Cameroon with the highest percentage of weekend submissions, pulls closer to the mean with only 100 observations. It is still has the second highest parameter, but it has significantly more variance than China with over 6,000 submissions.
